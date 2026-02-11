@@ -38,9 +38,10 @@ import (
 type talosMachineConfigurationApplyResource struct{}
 
 var (
-	_ resource.Resource                 = &talosMachineConfigurationApplyResource{}
-	_ resource.ResourceWithModifyPlan   = &talosMachineConfigurationApplyResource{}
-	_ resource.ResourceWithUpgradeState = &talosMachineConfigurationApplyResource{}
+	_ resource.Resource                   = &talosMachineConfigurationApplyResource{}
+	_ resource.ResourceWithModifyPlan     = &talosMachineConfigurationApplyResource{}
+	_ resource.ResourceWithUpgradeState   = &talosMachineConfigurationApplyResource{}
+	_ resource.ResourceWithValidateConfig = &talosMachineConfigurationApplyResource{}
 )
 
 var onDestroyMarkDownDescription = `Actions to be taken on destroy, if *reset* is not set this is a no-op.
@@ -59,17 +60,19 @@ type talosMachineConfigurationApplyResourceModelV0 struct {
 }
 
 type talosMachineConfigurationApplyResourceModelV1 struct { //nolint:govet
-	ID                        types.String        `tfsdk:"id"`
-	ApplyMode                 types.String        `tfsdk:"apply_mode"`
-	ResolvedApplyMode         types.String        `tfsdk:"resolved_apply_mode"`
-	Node                      types.String        `tfsdk:"node"`
-	Endpoint                  types.String        `tfsdk:"endpoint"`
-	ClientConfiguration       clientConfiguration `tfsdk:"client_configuration"`
-	MachineConfigurationInput types.String        `tfsdk:"machine_configuration_input"`
-	OnDestroy                 *onDestroyOptions   `tfsdk:"on_destroy"`
-	MachineConfiguration      types.String        `tfsdk:"machine_configuration"`
-	ConfigPatches             []types.String      `tfsdk:"config_patches"`
-	Timeouts                  timeouts.Value      `tfsdk:"timeouts"`
+	ID                          types.String          `tfsdk:"id"`
+	ApplyMode                   types.String          `tfsdk:"apply_mode"`
+	ResolvedApplyMode           types.String          `tfsdk:"resolved_apply_mode"`
+	Node                        types.String          `tfsdk:"node"`
+	Endpoint                    types.String          `tfsdk:"endpoint"`
+	ClientConfiguration         basetypes.ObjectValue `tfsdk:"client_configuration"`
+	ClientConfigurationWO       basetypes.ObjectValue `tfsdk:"client_configuration_wo"`
+	MachineConfigurationInput   types.String          `tfsdk:"machine_configuration_input"`
+	MachineConfigurationInputWO types.String          `tfsdk:"machine_configuration_input_wo"`
+	OnDestroy                   *onDestroyOptions     `tfsdk:"on_destroy"`
+	MachineConfiguration        types.String          `tfsdk:"machine_configuration"`
+	ConfigPatches               []types.String        `tfsdk:"config_patches"`
+	Timeouts                    timeouts.Value        `tfsdk:"timeouts"`
 }
 
 type onDestroyOptions struct {
@@ -139,13 +142,41 @@ func (p *talosMachineConfigurationApplyResource) Schema(ctx context.Context, _ r
 						Description: "The client key",
 					},
 				},
-				Required:    true,
+				Optional:    true,
 				Description: "The client configuration data",
+			},
+			"client_configuration_wo": schema.SingleNestedAttribute{
+				Attributes: map[string]schema.Attribute{
+					"ca_certificate": schema.StringAttribute{
+						Required:    true,
+						WriteOnly:   true,
+						Description: "The client CA certificate",
+					},
+					"client_certificate": schema.StringAttribute{
+						Required:    true,
+						WriteOnly:   true,
+						Description: "The client certificate",
+					},
+					"client_key": schema.StringAttribute{
+						Required:    true,
+						Sensitive:   true,
+						WriteOnly:   true,
+						Description: "The client key",
+					},
+				},
+				Optional:    true,
+				WriteOnly:   true,
+				Description: "The client configuration data (write-only). Use this instead of client_configuration when using ephemeral resources. Requires Terraform 1.11+",
 			},
 			"machine_configuration_input": schema.StringAttribute{
 				Description: "The machine configuration to apply",
-				Required:    true,
+				Optional:    true,
 				Sensitive:   true,
+			},
+			"machine_configuration_input_wo": schema.StringAttribute{
+				Description: "The machine configuration to apply (write-only). Use this instead of machine_configuration_input when using ephemeral resources. Requires Terraform 1.11+",
+				Optional:    true,
+				WriteOnly:   true,
 			},
 			"on_destroy": schema.SingleNestedAttribute{
 				Description:         "Actions to be taken on destroy, if `reset` is not set this is a no-op.",
@@ -191,6 +222,166 @@ func (p *talosMachineConfigurationApplyResource) Schema(ctx context.Context, _ r
 	}
 }
 
+func (p *talosMachineConfigurationApplyResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var config talosMachineConfigurationApplyResourceModelV1
+
+	diags := req.Config.Get(ctx, &config)
+	resp.Diagnostics.Append(diags...)
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	inputSet := !config.MachineConfigurationInput.IsNull()
+	inputWOSet := !config.MachineConfigurationInputWO.IsNull()
+
+	if !inputSet && !inputWOSet {
+		resp.Diagnostics.AddError(
+			"Missing machine configuration input",
+			"Exactly one of machine_configuration_input or machine_configuration_input_wo must be set",
+		)
+	}
+
+	if inputSet && inputWOSet {
+		resp.Diagnostics.AddError(
+			"Conflicting machine configuration input",
+			"Only one of machine_configuration_input or machine_configuration_input_wo can be set, not both",
+		)
+	}
+
+	clientConfigSet := !config.ClientConfiguration.IsNull()
+	clientConfigWOSet := !config.ClientConfigurationWO.IsNull()
+
+	if !clientConfigSet && !clientConfigWOSet {
+		resp.Diagnostics.AddError(
+			"Missing client configuration",
+			"Exactly one of client_configuration or client_configuration_wo must be set",
+		)
+	}
+
+	if clientConfigSet && clientConfigWOSet {
+		resp.Diagnostics.AddError(
+			"Conflicting client configuration",
+			"Only one of client_configuration or client_configuration_wo can be set, not both",
+		)
+	}
+}
+
+// getMachineConfigurationInput returns the effective machine configuration input value,
+// preferring the write-only attribute if set.
+func getMachineConfigurationInput(state *talosMachineConfigurationApplyResourceModelV1) types.String {
+	if !state.MachineConfigurationInputWO.IsNull() && !state.MachineConfigurationInputWO.IsUnknown() {
+		return state.MachineConfigurationInputWO
+	}
+
+	return state.MachineConfigurationInput
+}
+
+// getClientConfiguration returns the effective client configuration,
+// preferring the write-only attribute if set.
+func getClientConfiguration(state *talosMachineConfigurationApplyResourceModelV1) (config basetypes.ObjectValue, diagMsg string) {
+	woIsNull := state.ClientConfigurationWO.IsNull()
+	woIsUnknown := state.ClientConfigurationWO.IsUnknown()
+	regularIsNull := state.ClientConfiguration.IsNull()
+
+	// Prefer write-only if available and known
+	if !woIsNull && !woIsUnknown {
+		return state.ClientConfigurationWO, ""
+	}
+
+	// If write-only was provided but is still unknown, that's a problem
+	if !woIsNull && woIsUnknown {
+		return basetypes.NewObjectNull(map[string]attr.Type{
+			"ca_certificate":     types.StringType,
+			"client_certificate": types.StringType,
+			"client_key":         types.StringType,
+		}), "client_configuration_wo is still unknown (ephemeral value not yet resolved)"
+	}
+
+	// Fall back to regular client_configuration
+	if !regularIsNull {
+		return state.ClientConfiguration, ""
+	}
+
+	// Both are null
+	return basetypes.NewObjectNull(map[string]attr.Type{
+		"ca_certificate":     types.StringType,
+		"client_certificate": types.StringType,
+		"client_key":         types.StringType,
+	}), "both client_configuration and client_configuration_wo are null"
+}
+
+// getClientConfigurationValues extracts the client configuration values from the ObjectValue.
+// Returns empty strings and error message if extraction fails.
+// Handles both properly-typed ObjectValues and plain maps with correct keys (from Vault reconstruction).
+func getClientConfigurationValues(ctx context.Context, clientConfig basetypes.ObjectValue) (ca, cert, key, errMsg string, ok bool) {
+	if clientConfig.IsUnknown() {
+		return "", "", "", "client configuration is unknown", false
+	}
+
+	if clientConfig.IsNull() {
+		return "", "", "", "client configuration is null", false
+	}
+
+	var config clientConfiguration
+	if diags := clientConfig.As(ctx, &config, basetypes.ObjectAsOptions{}); diags.HasError() {
+		// Fallback: Extract values directly from the ObjectValue's attributes
+		// This handles cases where the object is a plain map with correct keys (e.g., reconstructed from Vault)
+		// without full schema metadata attached at runtime
+		attrs := clientConfig.Attributes()
+
+		caAttr, caOk := attrs["ca_certificate"]
+		certAttr, certOk := attrs["client_certificate"]
+		keyAttr, keyOk := attrs["client_key"]
+
+		if !caOk || !certOk || !keyOk {
+			missingKeys := []string{}
+			if !caOk {
+				missingKeys = append(missingKeys, "ca_certificate")
+			}
+			if !certOk {
+				missingKeys = append(missingKeys, "client_certificate")
+			}
+			if !keyOk {
+				missingKeys = append(missingKeys, "client_key")
+			}
+			return "", "", "", fmt.Sprintf("missing required keys: %v (available keys: %v)", missingKeys, getMapKeys(attrs)), false
+		}
+
+		// Type assert to StringValue and extract string
+		caVal, caIsString := caAttr.(basetypes.StringValue)
+		certVal, certIsString := certAttr.(basetypes.StringValue)
+		keyVal, keyIsString := keyAttr.(basetypes.StringValue)
+
+		if !caIsString || !certIsString || !keyIsString {
+			wrongTypes := []string{}
+			if !caIsString {
+				wrongTypes = append(wrongTypes, fmt.Sprintf("ca_certificate is %T", caAttr))
+			}
+			if !certIsString {
+				wrongTypes = append(wrongTypes, fmt.Sprintf("client_certificate is %T", certAttr))
+			}
+			if !keyIsString {
+				wrongTypes = append(wrongTypes, fmt.Sprintf("client_key is %T", keyAttr))
+			}
+			return "", "", "", fmt.Sprintf("wrong types for keys: %v", wrongTypes), false
+		}
+
+		return caVal.ValueString(), certVal.ValueString(), keyVal.ValueString(), "", true
+	}
+
+	return config.CA.ValueString(), config.Cert.ValueString(), config.Key.ValueString(), "", true
+}
+
+// getMapKeys returns the keys of a map for diagnostic purposes
+func getMapKeys(m map[string]attr.Value) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func (p *talosMachineConfigurationApplyResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) { //nolint:dupl
 	var state talosMachineConfigurationApplyResourceModelV1
 
@@ -201,11 +392,43 @@ func (p *talosMachineConfigurationApplyResource) Create(ctx context.Context, req
 		return
 	}
 
+	// DEBUG: Check state of client configuration attributes
+	resp.Diagnostics.AddWarning(
+		"DEBUG: Client configuration state after Plan.Get()",
+		fmt.Sprintf(
+			"ClientConfiguration: IsNull=%v, IsUnknown=%v | ClientConfigurationWO: IsNull=%v, IsUnknown=%v",
+			state.ClientConfiguration.IsNull(),
+			state.ClientConfiguration.IsUnknown(),
+			state.ClientConfigurationWO.IsNull(),
+			state.ClientConfigurationWO.IsUnknown(),
+		),
+	)
+
+	clientConfig, configDiag := getClientConfiguration(&state)
+	if configDiag != "" {
+		resp.Diagnostics.AddError(
+			"Client configuration issue",
+			configDiag,
+		)
+
+		return
+	}
+
+	ca, cert, key, errMsg, ok := getClientConfigurationValues(ctx, clientConfig)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Error reading client configuration",
+			errMsg,
+		)
+
+		return
+	}
+
 	talosClientConfig, err := talosClientTFConfigToTalosClientConfig(
 		"dynamic",
-		state.ClientConfiguration.CA.ValueString(),
-		state.ClientConfiguration.Cert.ValueString(),
-		state.ClientConfiguration.Key.ValueString(),
+		ca,
+		cert,
+		key,
 	)
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -281,11 +504,31 @@ func (p *talosMachineConfigurationApplyResource) Update(ctx context.Context, req
 		return
 	}
 
+	clientConfig, configDiag := getClientConfiguration(&state)
+	if configDiag != "" {
+		resp.Diagnostics.AddError(
+			"Client configuration issue",
+			configDiag,
+		)
+
+		return
+	}
+
+	ca, cert, key, errMsg, ok := getClientConfigurationValues(ctx, clientConfig)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Error reading client configuration",
+			errMsg,
+		)
+
+		return
+	}
+
 	talosClientConfig, err := talosClientTFConfigToTalosClientConfig(
 		"dynamic",
-		state.ClientConfiguration.CA.ValueString(),
-		state.ClientConfiguration.Cert.ValueString(),
-		state.ClientConfiguration.Key.ValueString(),
+		ca,
+		cert,
+		key,
 	)
 	if err != nil {
 		resp.Diagnostics.AddError(
@@ -368,11 +611,31 @@ func (p *talosMachineConfigurationApplyResource) Delete(ctx context.Context, req
 	}
 
 	if state.OnDestroy != nil && state.OnDestroy.Reset {
+		clientConfig, configDiag := getClientConfiguration(&state)
+		if configDiag != "" {
+			resp.Diagnostics.AddError(
+				"Client configuration issue",
+				configDiag,
+			)
+
+			return
+		}
+
+		ca, cert, key, errMsg, ok := getClientConfigurationValues(ctx, clientConfig)
+		if !ok {
+			resp.Diagnostics.AddError(
+				"Error reading client configuration",
+				errMsg,
+			)
+
+			return
+		}
+
 		talosClientConfig, err := talosClientTFConfigToTalosClientConfig(
 			"dynamic",
-			state.ClientConfiguration.CA.ValueString(),
-			state.ClientConfiguration.Cert.ValueString(),
-			state.ClientConfiguration.Key.ValueString(),
+			ca,
+			cert,
+			key,
 		)
 		if err != nil {
 			resp.Diagnostics.AddError(
@@ -506,11 +769,27 @@ func (p *talosMachineConfigurationApplyResource) handleRebootPrevention(
 		endpoint = planState.Node.ValueString()
 	}
 
+	// Cannot perform dry-run if client configuration is unknown (from ephemeral resource)
+	clientConfig, configDiag := getClientConfiguration(planState)
+	if configDiag != "" {
+		// If configuration is not available (unknown/null), fall back to auto mode
+		setResolvedApplyMode(ctx, resp, "auto")
+
+		return
+	}
+
+	ca, cert, key, _, ok := getClientConfigurationValues(ctx, clientConfig)
+	if !ok {
+		setResolvedApplyMode(ctx, resp, "auto")
+
+		return
+	}
+
 	talosClientConfig, err := talosClientTFConfigToTalosClientConfig(
 		"dynamic",
-		planState.ClientConfiguration.CA.ValueString(),
-		planState.ClientConfiguration.Cert.ValueString(),
-		planState.ClientConfiguration.Key.ValueString(),
+		ca,
+		cert,
+		key,
 	)
 	if err != nil {
 		resp.Diagnostics.AddWarning(
@@ -626,7 +905,9 @@ func (p *talosMachineConfigurationApplyResource) ModifyPlan(ctx context.Context,
 		}
 	}
 
-	if !planState.MachineConfigurationInput.IsUnknown() && !planState.MachineConfigurationInput.IsNull() {
+	machineConfigInput := getMachineConfigurationInput(&planState)
+
+	if !machineConfigInput.IsUnknown() && !machineConfigInput.IsNull() {
 		configPatches := make([]string, len(planState.ConfigPatches))
 
 		for i, patch := range planState.ConfigPatches {
@@ -650,7 +931,7 @@ func (p *talosMachineConfigurationApplyResource) ModifyPlan(ctx context.Context,
 			return
 		}
 
-		cfg, err := configpatcher.Apply(configpatcher.WithBytes([]byte(planState.MachineConfigurationInput.ValueString())), patches)
+		cfg, err := configpatcher.Apply(configpatcher.WithBytes([]byte(machineConfigInput.ValueString())), patches)
 		if err != nil {
 			resp.Diagnostics.AddError(
 				"Error applying config patches",

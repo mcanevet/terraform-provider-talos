@@ -5,10 +5,12 @@
 package talos_test
 
 import (
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
 func TestAccTalosMachineConfigurationApplyResource(t *testing.T) {
@@ -179,6 +181,96 @@ func testAccTalosMachineConfigurationApplyResourceConfigV1(providerName, rName s
 	return config.render()
 }
 
+func TestAccTalosMachineConfigurationApplyValidateNeitherInput(t *testing.T) {
+	t.Parallel()
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "talos_machine_configuration_apply" "this" {
+  node = "10.5.0.2"
+  client_configuration = {
+    ca_certificate     = "ca"
+    client_certificate = "cert"
+    client_key         = "key"
+  }
+}
+`,
+				ExpectError: regexp.MustCompile(`Missing machine configuration input`),
+			},
+		},
+	})
+}
+
+func TestAccTalosMachineConfigurationApplyValidateBothInputs(t *testing.T) {
+	t.Parallel()
+
+	resource.UnitTest(t, resource.TestCase{
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.SkipBelow(tfversion.Version1_11_0),
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "talos_machine_configuration_apply" "this" {
+  node = "10.5.0.2"
+  client_configuration = {
+    ca_certificate     = "ca"
+    client_certificate = "cert"
+    client_key         = "key"
+  }
+  machine_configuration_input    = "some-config"
+  machine_configuration_input_wo = "some-config"
+}
+`,
+				ExpectError: regexp.MustCompile(`Conflicting machine configuration input`),
+			},
+		},
+	})
+}
+
+func TestAccTalosMachineConfigurationApplyValidateWriteOnlyInput(t *testing.T) {
+	t.Parallel()
+
+	resource.UnitTest(t, resource.TestCase{
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.SkipBelow(tfversion.Version1_11_0),
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "talos_machine_secrets" "this" {}
+
+data "talos_machine_configuration" "this" {
+  cluster_name     = "test-cluster"
+  cluster_endpoint = "https://10.0.0.1:6443"
+  machine_type     = "controlplane"
+  machine_secrets  = talos_machine_secrets.this.machine_secrets
+}
+
+resource "talos_machine_configuration_apply" "this" {
+  node = "10.5.0.2"
+  client_configuration = {
+    ca_certificate     = "ca"
+    client_certificate = "cert"
+    client_key         = "key"
+  }
+  machine_configuration_input_wo = data.talos_machine_configuration.this.machine_configuration
+}
+`,
+				// Validation passes (no "Missing" or "Conflicting" error).
+				// The error comes from the apply phase, proving that the
+				// write-only input was accepted and plan succeeded.
+				ExpectError: regexp.MustCompile(`Error (applying|converting) config`),
+			},
+		},
+	})
+}
+
 func testAccTalosMachineConfigurationApplyResourceConfigWithAutoStaged(providerName, rName string) string {
 	config := dynamicConfig{
 		Provider:        providerName,
@@ -212,3 +304,39 @@ resource "talos_machine_configuration_apply" "staged_if_needing_reboot" {
 }
 `
 }
+
+func TestAccTalosMachineConfigurationApplyWithUnknownClientConfig(t *testing.T) {
+	t.Parallel()
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "talos_machine_secrets" "this" {}
+
+data "talos_machine_configuration" "this" {
+  cluster_name     = "test-cluster"
+  cluster_endpoint = "https://10.5.0.2:6443"
+  machine_type     = "controlplane"
+  machine_secrets  = talos_machine_secrets.this.machine_secrets
+}
+
+resource "talos_machine_configuration_apply" "this" {
+  # client_configuration comes from a computed attribute, so it's unknown during plan
+  client_configuration        = talos_machine_secrets.this.client_configuration
+  machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
+  node                        = "10.5.0.2"
+
+  # This apply_mode triggers reboot prevention logic which needs to handle unknown client_config
+  apply_mode = "staged_if_needing_reboot"
+}
+`,
+				// PlanOnly ensures we test the plan phase where client_configuration is unknown
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
