@@ -1,33 +1,40 @@
+locals {
+  talos_version      = "v1.13.2"
+  kubernetes_version = "v1.36.0"
+}
+
 resource "talos_machine_secrets" "this" {}
 
-data "talos_machine_configuration" "this" {
+ephemeral "talos_machine_configuration" "this" {
   cluster_name       = "example-cluster"
   machine_type       = "controlplane"
   cluster_endpoint   = "https://10.5.0.2:6443"
   machine_secrets    = talos_machine_secrets.this.machine_secrets
-  kubernetes_version = "v1.32.0"
-}
-
-resource "talos_machine_configuration_apply" "this" {
-  client_configuration        = talos_machine_secrets.this.client_configuration
-  machine_configuration_input = data.talos_machine_configuration.this.machine_configuration
-  node                        = "10.5.0.2"
+  talos_version      = local.talos_version
+  kubernetes_version = local.kubernetes_version
   config_patches = [
     yamlencode({
       machine = {
         install = {
-          disk = "/dev/sda"
+          disk  = "/dev/sda"
+          image = "ghcr.io/siderolabs/installer:${local.talos_version}"
         }
       }
     })
   ]
 }
 
+resource "talos_machine" "this" {
+  node                     = "10.5.0.2"
+  client_configuration     = talos_machine_secrets.this.client_configuration
+  machine_configuration_wo = ephemeral.talos_machine_configuration.this.machine_configuration
+  image                    = "ghcr.io/siderolabs/installer:${local.talos_version}"
+}
+
 resource "talos_cluster" "this" {
-  depends_on           = [talos_machine_configuration_apply.this]
-  node                 = "10.5.0.2"
+  node                 = talos_machine.this.node
   client_configuration = talos_machine_secrets.this.client_configuration
-  kubernetes_version   = "v1.32.0"
+  kubernetes_version   = local.kubernetes_version
 }
 
 data "talos_cluster_kubeconfig" "this" {

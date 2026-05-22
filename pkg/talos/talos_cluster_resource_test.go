@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 	"github.com/siderolabs/talos/pkg/machinery/gendata"
 )
 
@@ -79,6 +80,59 @@ func TestAccTalosCluster_upgrade(t *testing.T) {
 			// Step 3: idempotency after upgrade
 			{
 				Config:   testAccTalosClusterConfig(rName, gendata.VersionTag, upgradeK8sVersion),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// TestAccTalosCluster_k8sUpgradeWithMachine validates the recommended upgrade path when
+// talos_machine and talos_cluster are used together. The concern (raised in issue #140)
+// is that upgrade-k8s patches the persisted machine config on disk, causing talos_machine
+// to see a hash mismatch and re-apply the old config, rolling back the K8s version.
+//
+// The safe pattern: update kubernetes_version in both talos_machine_configuration and
+// talos_cluster in the same apply. This test proves the approach is idempotent.
+func TestAccTalosCluster_k8sUpgradeWithMachine(t *testing.T) {
+	const (
+		baseK8sVersion    = "v1.35.4"
+		upgradeK8sVersion = "v1.36.0"
+	)
+
+	rName := acctest.RandStringFromCharSet(10, acctest.CharSetAlpha)
+
+	resource.ParallelTest(t, resource.TestCase{
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.SkipBelow(tfversion.Version1_11_0),
+		},
+		ExternalProviders: map[string]resource.ExternalProvider{
+			"libvirt": {
+				Source:            "dmacvicar/libvirt",
+				VersionConstraint: "= 0.8.3",
+			},
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			// Step 1: bootstrap talos_machine + talos_cluster at base K8s version
+			{
+				Config: testAccTalosClusterWithMachineConfig(rName, gendata.VersionTag, baseK8sVersion),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("talos_machine.this", "machine_configuration_hash"),
+					resource.TestCheckResourceAttr("talos_cluster.this", "kubernetes_version", baseK8sVersion),
+				),
+			},
+			// Step 2: upgrade K8s — kubernetes_version updated in both talos_machine_configuration
+			// and talos_cluster simultaneously; talos_machine must not show drift afterwards
+			{
+				Config: testAccTalosClusterWithMachineConfig(rName, gendata.VersionTag, upgradeK8sVersion),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("talos_cluster.this", "kubernetes_version", upgradeK8sVersion),
+					resource.TestCheckResourceAttrSet("talos_machine.this", "machine_configuration_hash"),
+				),
+			},
+			// Step 3: idempotency — no drift expected after the upgrade
+			{
+				Config:   testAccTalosClusterWithMachineConfig(rName, gendata.VersionTag, upgradeK8sVersion),
 				PlanOnly: true,
 			},
 		},
@@ -488,6 +542,133 @@ resource "talos_cluster" "this" {
   timeouts = {
     create = "20m"
     update = "30m"
+  }
+}
+`, rName, cpuMode, isoURL, talosVersion, k8sVersion)
+}
+
+func testAccTalosClusterWithMachineConfig(rName, talosVersion, k8sVersion string) string {
+	cpuMode := cpuModeHostPassthrough
+	if os.Getenv("CI") != "" {
+		cpuMode = cpuModeHostModel
+	}
+
+	isoURL := fmt.Sprintf(
+		"https://github.com/siderolabs/talos/releases/download/%s/metal-amd64.iso",
+		talosVersion,
+	)
+
+	return fmt.Sprintf(`
+resource "talos_machine_secrets" "this" {}
+
+ephemeral "talos_machine_configuration" "this" {
+  cluster_name       = "test"
+  cluster_endpoint   = "https://${libvirt_domain.cp.network_interface[0].addresses[0]}:6443"
+  machine_type       = "controlplane"
+  machine_secrets    = talos_machine_secrets.this.machine_secrets
+  talos_version      = %[4]q
+  kubernetes_version = %[5]q
+  docs               = false
+  examples           = false
+  config_patches = [
+    yamlencode({
+      machine = {
+        install = {
+          disk  = "/dev/vda"
+          image = "ghcr.io/siderolabs/installer:%[4]s"
+        }
+      }
+    })
+  ]
+}
+
+resource "libvirt_volume" "cp" {
+  name = %[1]q
+  size = 6442450944
+}
+
+resource "libvirt_domain" "cp" {
+  name     = %[1]q
+  firmware = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+
+  nvram {
+    file     = "/var/lib/libvirt/qemu/nvram/%[1]s_VARS.fd"
+    template = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+  }
+
+  lifecycle {
+    ignore_changes = [cpu, nvram, disk["url"]]
+  }
+
+  cpu {
+    mode = %[2]q
+  }
+
+  console {
+    type        = "pty"
+    target_port = "0"
+  }
+
+  graphics {
+    type        = "vnc"
+    listen_type = "address"
+  }
+
+  disk {
+    url = %[3]q
+  }
+
+  disk {
+    volume_id = libvirt_volume.cp.id
+  }
+
+  boot_device {
+    dev = ["cdrom"]
+  }
+
+  network_interface {
+    network_name   = "default"
+    wait_for_lease = true
+  }
+
+  vcpu   = "2"
+  memory = "4096"
+}
+
+resource "talos_machine" "this" {
+  node                     = libvirt_domain.cp.network_interface[0].addresses[0]
+  endpoint                 = libvirt_domain.cp.network_interface[0].addresses[0]
+  client_configuration     = talos_machine_secrets.this.client_configuration
+  machine_configuration_wo = ephemeral.talos_machine_configuration.this.machine_configuration
+  image                    = "ghcr.io/siderolabs/installer:%[4]s"
+  drain_on_upgrade         = false
+
+  timeouts = {
+    create = "20m"
+    update = "60m"
+    delete = "5m"
+  }
+}
+
+resource "talos_cluster" "this" {
+  node                 = talos_machine.this.node
+  client_configuration = talos_machine_secrets.this.client_configuration
+  kubernetes_version   = %[5]q
+
+  timeouts = {
+    create = "20m"
+    update = "30m"
+  }
+}
+
+data "talos_cluster_health" "this" {
+  depends_on           = [talos_cluster.this]
+  client_configuration = talos_machine_secrets.this.client_configuration
+  endpoints            = libvirt_domain.cp.network_interface[0].addresses
+  control_plane_nodes  = libvirt_domain.cp.network_interface[0].addresses
+
+  timeouts = {
+    read = "20m"
   }
 }
 `, rName, cpuMode, isoURL, talosVersion, k8sVersion)
